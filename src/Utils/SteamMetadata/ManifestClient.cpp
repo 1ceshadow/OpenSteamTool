@@ -6,6 +6,9 @@
 
 #include <algorithm>
 #include <charconv>
+#include <chrono>
+#include <cstdio>
+#include <iterator>
 #include <mutex>
 #include <string_view>
 
@@ -37,6 +40,10 @@ namespace ManifestClient {
     // Adding a new provider: add one row to kProviders below.
     // host / port / tls / path are all derived from the URL template
     // by Make() at compile time.
+    //
+    // Order matters only as the tie-break for a cold start: the first
+    // entry is the initial active provider, and failures walk forward
+    // from there.
 
     struct Provider {
         std::string_view name;          // matches [manifest] url = "..."
@@ -54,22 +61,34 @@ namespace ManifestClient {
         Make("steamrun",      "https://manifest.steam.run/api/manifest/%llu",  ParseSteamRunJson),
     };
 
-    static const Provider* g_active = &kProviders[0];   // opensteamtool
-    static std::mutex      g_mutex;
+    static constexpr size_t kProviderCount = std::size(kProviders);
+
+    // Index of the last provider that answered, so the healthy one is tried
+    // first on the next fetch.  Mutated under g_mutex.
+    static size_t g_active = 0;                         // opensteamtool
+
+    // Per-provider deadline; while it is in the future the provider is
+    // skipped rather than paying its timeout again.
+    static std::chrono::steady_clock::time_point g_deadUntil[kProviderCount];
+
+    static std::mutex g_mutex;
 
     bool SetProvider(std::string_view name) {
         std::lock_guard<std::mutex> lock(g_mutex);
-        for (const auto& p : kProviders)
-            if (p.name == name) { 
-                g_active = &p; 
-                return true; 
+        for (size_t i = 0; i < kProviderCount; ++i)
+            if (kProviders[i].name == name) {
+                g_active = i;
+                // Explicit choice (startup or config reload) overrides the
+                // cooldowns learned at runtime, so it takes effect at once.
+                for (auto& dead : g_deadUntil) dead = {};
+                return true;
             }
         return false;
     }
 
     const char* ActiveProviderName() {
         std::lock_guard<std::mutex> lock(g_mutex);
-        return g_active->name.data(); 
+        return kProviders[g_active].name.data();
     }
 
     // ── request ───────────────────────────────────────────────────
@@ -80,28 +99,72 @@ namespace ManifestClient {
 
     // ── fetch ─────────────────────────────────────────────────────
 
-    static bool FetchActive(uint64_t gid, uint64_t* outCode) {
-        const Provider& p = *g_active;
+    // Tries the active provider first, then fails over through the rest of
+    // the table.  A provider that just failed goes into cooldown so a dead
+    // upstream costs one timeout instead of one per depot; when every
+    // provider is cooling down this returns false without any network I/O.
+    static bool FetchWithFailover(uint64_t gid, uint64_t* outCode) {
         const Config::ManifestTimeouts timeouts = Config::GetManifestTimeouts();
+        const auto deadline = std::chrono::steady_clock::now()
+                            + std::chrono::milliseconds(kFetchBudgetMs);
 
-        char urlLog[256];
-        std::snprintf(urlLog, sizeof(urlLog), p.urlTemplate, gid);
+        size_t tried = 0;
+        for (size_t k = 0; k < kProviderCount; ++k) {
+            const size_t i = (g_active + k) % kProviderCount;
+            const Provider& p = kProviders[i];
 
-        auto r = OSTPlatform::Http::Execute(
-            L"GET",
-            urlLog,
-            nullptr,
-            0,
-            nullptr,
-            timeouts.resolve,
-            timeouts.connect,
-            timeouts.send,
-            timeouts.recv);
+            if (g_deadUntil[i] > std::chrono::steady_clock::now()) {
+                LOG_MANIFEST_DEBUG("Manifest {} skipped (cooldown)", p.name);
+                continue;
+            }
 
-        LOG_MANIFEST_INFO("Manifest {} status={} gid={}", p.name, r.status, gid);
+            // Never let one attempt outlive the shared budget — the hook
+            // stops waiting at kFetchBudgetMs, so a slower answer is useless
+            // to Steam and would only delay the next depot's fetch.
+            const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
+                deadline - std::chrono::steady_clock::now()).count();
+            if (left <= 0) {
+                LOG_MANIFEST_WARN("Manifest gid={}: {}ms budget exhausted after {} attempt(s)",
+                                  gid, kFetchBudgetMs, tried);
+                break;
+            }
+            const auto cap = [left](uint32_t ms) {
+                return static_cast<uint32_t>(std::min<int64_t>(ms, left));
+            };
 
-        if (!r.ok || r.status != 200) return false;
-        return p.parse(r.body, outCode);
+            char urlLog[256];
+            std::snprintf(urlLog, sizeof(urlLog), p.urlTemplate, gid);
+
+            auto r = OSTPlatform::Http::Execute(
+                L"GET",
+                urlLog,
+                nullptr,
+                0,
+                nullptr,
+                cap(timeouts.resolve),
+                cap(timeouts.connect),
+                cap(timeouts.send),
+                cap(timeouts.recv));
+
+            LOG_MANIFEST_INFO("Manifest {} status={} gid={}", p.name, r.status, gid);
+            ++tried;
+
+            if (r.ok && r.status == 200 && p.parse(r.body, outCode)) {
+                if (i != g_active) {
+                    LOG_MANIFEST_WARN("Manifest provider switched {} -> {}",
+                                      kProviders[g_active].name, p.name);
+                    g_active = i;
+                }
+                return true;
+            }
+
+            g_deadUntil[i] = std::chrono::steady_clock::now()
+                           + std::chrono::milliseconds(kProviderCooldownMs);
+        }
+
+        if (tried == 0)
+            LOG_MANIFEST_WARN("Manifest gid={}: every provider is in cooldown", gid);
+        return false;
     }
 
     // ── public ────────────────────────────────────────────────────
@@ -127,6 +190,6 @@ namespace ManifestClient {
             LOG_MANIFEST_WARN("Manifest gid={} lua returned nil, falling back to config", manifestGid);
         }
 
-        return FetchActive(manifestGid, outRequestCode);
+        return FetchWithFailover(manifestGid, outRequestCode);
     }
 }
