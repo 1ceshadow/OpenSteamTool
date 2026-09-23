@@ -81,6 +81,15 @@ namespace ManifestClient {
     // skipped rather than paying its timeout again.
     static std::chrono::steady_clock::time_point g_deadUntil[kProviderCount];
 
+    // Per-provider success counter, bumped on every answer.  Fetches run
+    // concurrently, so a failure can land after a success for the same
+    // provider -- Steam starts many depots at once, and an upstream under
+    // that burst may well 429 one request while answering another.  An
+    // attempt reads this before it starts and hands it back on failure; a
+    // mismatch means a success has landed since, so the failure is reporting
+    // state that has already been disproved and must not set a cooldown.
+    static uint64_t g_okSeq[kProviderCount] = {};
+
     static size_t ActiveIndex() {
         std::lock_guard<std::mutex> lock(g_stateMutex);
         return g_active;
@@ -91,20 +100,38 @@ namespace ManifestClient {
         return g_deadUntil[i] > now;
     }
 
-    static void MarkFailed(size_t i, std::chrono::steady_clock::time_point now) {
+    // Read before an attempt, passed back to MarkFailed afterwards.
+    static uint64_t OkSeq(size_t i) {
         std::lock_guard<std::mutex> lock(g_stateMutex);
+        return g_okSeq[i];
+    }
+
+    static void MarkFailed(size_t i, std::chrono::steady_clock::time_point now, uint64_t seq) {
+        std::lock_guard<std::mutex> lock(g_stateMutex);
+        // A success landed while this attempt was failing. Anything we could
+        // say about the provider is now stale; the success is the better
+        // evidence, so leave its cleared cooldown alone.
+        if (g_okSeq[i] != seq) {
+            LOG_MANIFEST_DEBUG("Manifest {} failure ignored (superseded by a success)",
+                               kProviders[i].name);
+            return;
+        }
         g_deadUntil[i] = now + std::chrono::milliseconds(kProviderCooldownMs);
     }
 
-    // Promote the provider that just answered, so the next fetch starts there.
-    static void Promote(size_t i) {
+    // Record a provider that just answered, and make it the starting point of
+    // the next fetch.
+    static void RecordSuccess(size_t i) {
         std::lock_guard<std::mutex> lock(g_stateMutex);
+        ++g_okSeq[i];
+        // Unconditionally, including when this provider is already active: a
+        // 200 is proof it is alive, and a concurrent attempt may have left a
+        // spurious cooldown behind.
+        g_deadUntil[i] = {};
         if (i == g_active) return;
         LOG_MANIFEST_WARN("Manifest provider switched {} -> {}",
                           kProviders[g_active].name, kProviders[i].name);
         g_active = i;
-        // The winner is demonstrably alive; drop any stale cooldown on it.
-        g_deadUntil[i] = {};
     }
 
     bool SetProvider(std::string_view name) {
@@ -119,8 +146,11 @@ namespace ManifestClient {
                 if (i == g_active) return true;
                 g_active = i;
                 // An explicit switch is a fresh start for the chosen provider
-                // only; what we learned about the others still holds.
+                // only; what we learned about the others still holds. Bump the
+                // sequence too, so an attempt already in flight against this
+                // provider cannot immediately undo the clear.
                 g_deadUntil[i] = {};
+                ++g_okSeq[i];
                 return true;
             }
         return false;
@@ -163,6 +193,10 @@ namespace ManifestClient {
                 continue;
             }
 
+            // Read before the request goes out, so that any success landing
+            // while we wait is guaranteed to change it. Checked by MarkFailed.
+            const uint64_t seq = OkSeq(i);
+
             // Never let one attempt outlive the shared budget — the hook
             // stops waiting at kFetchBudgetMs, so a slower answer is useless
             // to Steam and would only delay the next depot's fetch.
@@ -203,11 +237,11 @@ namespace ManifestClient {
             ++tried;
 
             if (r.ok && r.status == 200 && p.parse(r.body, outCode)) {
-                Promote(i);
+                RecordSuccess(i);
                 return true;
             }
 
-            MarkFailed(i, std::chrono::steady_clock::now());
+            MarkFailed(i, std::chrono::steady_clock::now(), seq);
         }
 
         if (tried == 0)
