@@ -11,7 +11,11 @@
 //  when one fails, so a single dead upstream no longer breaks depot
 //  downloads.
 //
-//  Thread-safe — serialises access to the underlying WinHTTP connection.
+//  Thread-safe, and concurrent fetches do run concurrently: each HTTP
+//  request owns its own WinHTTP session, so nothing is serialised
+//  except the provider state and the shared lua_State.  A dead upstream
+//  therefore costs every waiting depot one timeout in parallel, not one
+//  timeout each in sequence.
 // ─────────────────────────────────────────────────────────────────
 namespace ManifestClient {
 
